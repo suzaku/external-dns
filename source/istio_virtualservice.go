@@ -23,6 +23,7 @@ import (
 	"strings"
 	"text/template"
 
+	"golang.org/x/sync/errgroup"
 	networkingv1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
 
 	log "github.com/sirupsen/logrus"
@@ -137,43 +138,64 @@ func (sc *virtualServiceSource) Endpoints(ctx context.Context) ([]*endpoint.Endp
 	}
 
 	var endpoints []*endpoint.Endpoint
+	chEndpoints := make(chan []*endpoint.Endpoint, 1)
 
-	for _, virtualService := range virtualServices {
-		// Check controller annotation to see if we are responsible.
-		controller, ok := virtualService.Annotations[controllerAnnotationKey]
-		if ok && controller != controllerAnnotationValue {
-			log.Debugf("Skipping VirtualService %s/%s because controller value does not match, found: %s, required: %s",
-				virtualService.Namespace, virtualService.Name, controller, controllerAnnotationValue)
-			continue
+	go func() {
+		for ep := range chEndpoints {
+			endpoints = append(endpoints, ep...)
 		}
+	}()
 
-		gwEndpoints, err := sc.endpointsFromVirtualService(ctx, virtualService)
-		if err != nil {
-			return nil, err
-		}
-
-		// apply template if host is missing on VirtualService
-		if (sc.combineFQDNAnnotation || len(gwEndpoints) == 0) && sc.fqdnTemplate != nil {
-			iEndpoints, err := sc.endpointsFromTemplate(ctx, virtualService)
-			if err != nil {
-				return nil, err
+	chVS := make(chan networkingv1alpha3.VirtualService, 1)
+	eg, eCtx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		defer close(chVS)
+		for _, virtualService := range virtualServices {
+			// Check controller annotation to see if we are responsible.
+			controller, ok := virtualService.Annotations[controllerAnnotationKey]
+			if ok && controller != controllerAnnotationValue {
+				log.Debugf("Skipping VirtualService %s/%s because controller value does not match, found: %s, required: %s",
+					virtualService.Namespace, virtualService.Name, controller, controllerAnnotationValue)
+				continue
 			}
-
-			if sc.combineFQDNAnnotation {
-				gwEndpoints = append(gwEndpoints, iEndpoints...)
-			} else {
-				gwEndpoints = iEndpoints
+			select {
+			case chVS <- virtualService:
+			case <-eCtx.Done():
+				return eCtx.Err()
 			}
 		}
+		return nil
+	})
 
-		if len(gwEndpoints) == 0 {
-			log.Debugf("No endpoints could be generated from VirtualService %s/%s", virtualService.Namespace, virtualService.Name)
-			continue
-		}
+	for i := 0; i < 3; i++ {
+		eg.Go(func() error {
+			for virtualService := range chVS {
+				gwEndpoints, err := sc.generateEndpoints(eCtx, virtualService)
+				if err != nil {
+					return err
+				}
 
-		log.Debugf("Endpoints generated from VirtualService: %s/%s: %v", virtualService.Namespace, virtualService.Name, gwEndpoints)
-		sc.setResourceLabel(virtualService, gwEndpoints)
-		endpoints = append(endpoints, gwEndpoints...)
+				if len(gwEndpoints) == 0 {
+					log.Debugf("No endpoints could be generated from VirtualService %s/%s", virtualService.Namespace, virtualService.Name)
+					continue
+				}
+
+				log.Debugf("Endpoints generated from VirtualService: %s/%s: %v", virtualService.Namespace, virtualService.Name, gwEndpoints)
+				sc.setResourceLabel(virtualService, gwEndpoints)
+				select {
+				case chEndpoints <- gwEndpoints:
+				case <-eCtx.Done():
+					return eCtx.Err()
+				}
+			}
+			return nil
+		})
+	}
+
+	err = eg.Wait()
+	close(chEndpoints)
+	if err != nil {
+		return nil, err
 	}
 
 	for _, ep := range endpoints {
@@ -181,6 +203,29 @@ func (sc *virtualServiceSource) Endpoints(ctx context.Context) ([]*endpoint.Endp
 	}
 
 	return endpoints, nil
+}
+
+func (sc *virtualServiceSource) generateEndpoints(ctx context.Context, virtualService networkingv1alpha3.VirtualService) ([]*endpoint.Endpoint, error) {
+	gwEndpoints, err := sc.endpointsFromVirtualService(ctx, virtualService)
+	if err != nil {
+		return nil, err
+	}
+
+	// apply template if host is missing on VirtualService
+	if (sc.combineFQDNAnnotation || len(gwEndpoints) == 0) && sc.fqdnTemplate != nil {
+		iEndpoints, err := sc.endpointsFromTemplate(ctx, virtualService)
+		if err != nil {
+			return nil, err
+		}
+
+		if sc.combineFQDNAnnotation {
+			gwEndpoints = append(gwEndpoints, iEndpoints...)
+		} else {
+			gwEndpoints = iEndpoints
+		}
+	}
+
+	return gwEndpoints, nil
 }
 
 // AddEventHandler adds an event handler that should be triggered if the watched Istio VirtualService changes.
@@ -274,8 +319,9 @@ func (sc *virtualServiceSource) filterByAnnotations(virtualservices []networking
 }
 
 func (sc *virtualServiceSource) setResourceLabel(virtualservice networkingv1alpha3.VirtualService, endpoints []*endpoint.Endpoint) {
+	r := fmt.Sprintf("virtualservice/%s/%s", virtualservice.Namespace, virtualservice.Name)
 	for _, ep := range endpoints {
-		ep.Labels[endpoint.ResourceLabelKey] = fmt.Sprintf("virtualservice/%s/%s", virtualservice.Namespace, virtualservice.Name)
+		ep.Labels[endpoint.ResourceLabelKey] = r
 	}
 }
 
